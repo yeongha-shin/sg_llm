@@ -54,12 +54,17 @@ class DynamicCRF:
             "B_stand_on_A", "B_give_way_A",
             "approaching", "passing", "near", "none"
         ]
+
         self.near_dist = 30.0
         self.vhf_parser = VHFIntentParser()
         self.prev_edge_beliefs = {}
         self.temporal_weight = 2.0
+
         self.intent_memory = {}  # sender_id -> strength
         self.intent_decay = 0.9
+
+        self.coop = {}  # ship_id -> p(cooperative)
+        self.coop_decay = 0.98
 
     # ---------- utils ----------
     def _wrap(self, a):
@@ -231,6 +236,18 @@ class DynamicCRF:
             node_beliefs[i] = self._softmax(node_beliefs[i])
         return node_beliefs
 
+    def update_coop_from_action(self, ship_id, delta_heading, p_app):
+        # p_app: 1번->TSS approaching 확률
+        # delta_heading: 이번 프레임 heading 변화량(abs)
+        evidence = min(abs(delta_heading) / math.radians(5), 1.0)  # 0~1
+        # approaching 상황일수록 evidence를 더 신뢰
+        w = 0.5 * p_app
+
+        # Bayesian-ish update (간단한 EMA)
+        prior = self.coop.get(ship_id, 0.5)
+        post = (1 - w) * prior + w * evidence
+        self.coop[ship_id] = post
+
     def apply_relation_mutex(self, scores):
         """
         Penalize mutually exclusive relations (soft constraint)
@@ -258,6 +275,7 @@ class DynamicCRF:
             self,
             obs: List[ObjObs],
             vhf_messages: Optional[List[VHFMessage]] = None,
+            delta_heading: Optional[Dict[int, float]] = None,
             mf_iters: int = 3,
     ):
         # --------------------------------------------------
@@ -345,18 +363,33 @@ class DynamicCRF:
                             if ok.det_label != "ship":
                                 continue
 
-                            key2 = tuple(sorted((ok.obj_id, i)))
+                            k_id = ok.obj_id
+
+                            # ----------------------------------
+                            # ✅ (1) coop 업데이트 (행동 기반)
+                            # ----------------------------------
+                            if delta_heading is not None:
+                                dh = delta_heading.get(k_id, 0.0)
+                                self.update_coop_from_action(
+                                    ship_id=k_id,
+                                    delta_heading=dh,
+                                    p_app=p_app
+                                )
+
+                            # ----------------------------------
+                            # (2) coop 반영하여 relation 보정
+                            # ----------------------------------
+                            key2 = tuple(sorted((k_id, i)))
                             if key2 not in edge_beliefs:
                                 continue
 
                             p2 = dict(edge_beliefs[key2])
+                            p_coop = self.coop.get(k_id, 0.5)
 
-                            # approaching strength → give-way strength
-                            p2["B_give_way_A"] += 3.0 * p_app
-                            p2["A_stand_on_B"] += 2.0 * p_app
+                            p2["B_give_way_A"] += 3.0 * p_app * p_coop
+                            p2["A_stand_on_B"] += 3.0 * p_app * p_coop
 
-                            # suppress conflicting relations
-                            p2["crossing"] -= 2.0 * p_app
+                            p2["crossing"] -= 2.0 * p_app * p_coop
                             p2["head_on"] -= 2.0 * p_app
                             p2["overtaking"] -= 2.0 * p_app
 
@@ -499,36 +532,51 @@ class SimulationRunner:
         red = obs[0]
         blue = obs[1]
 
+        # ✅ 프레임 간 heading 기억
+        prev_heading = {o.obj_id: o.heading for o in obs}
+
         for t in range(steps):
             for o in obs:
                 o.t = t
 
-            # red → TSS
-            # dx, dy = tss.x - red.x, tss.y - red.y
-            # red.heading = math.atan2(dy, dx)
-            # red.vx = 6 * math.cos(red.heading)
-            # red.vy = 6 * math.sin(red.heading)
-            # red.x += red.vx * dt
-            # red.y += red.vy * dt
-
+            # -------------------------
+            # motion update
+            # -------------------------
             target_heading = math.atan2(tss.y - red.y, tss.x - red.x)
 
-            if t > 8:  # ⏱️ 일정 시간 이후부터 회두 시작
+            if t > 8:
                 gradual_turn_towards(
                     red,
                     target_heading=target_heading,
-                    max_turn_rate=math.radians(6),  # deg/sec
+                    max_turn_rate=math.radians(6),
                     dt=dt
                 )
 
             update_position(red, dt)
 
-            # blue straight
             blue.x += blue.vx * dt
             blue.y += blue.vy * dt
 
-            nodes, edges = self.crf.infer_frame(obs, vhf)
+            # -------------------------
+            # ✅ delta_heading 계산 (프레임 1회)
+            # -------------------------
+            delta_heading = {}
+            for o in obs:
+                delta_heading[o.obj_id] = abs(o.heading - prev_heading[o.obj_id])
+                prev_heading[o.obj_id] = o.heading
 
+            # -------------------------
+            # CRF inference
+            # -------------------------
+            nodes, edges = self.crf.infer_frame(
+                obs,
+                vhf_messages=vhf,
+                delta_heading=delta_heading
+            )
+
+            # -------------------------
+            # visualization
+            # -------------------------
             fig, ax = plt.subplots(figsize=(7, 7))
             self.viz.visualize(obs, nodes, edges, ax=ax)
             ax.set_xlim(-80, 80)
@@ -541,6 +589,7 @@ class SimulationRunner:
             frames.append(imageio.imread(fname))
 
         imageio.mimsave("scene_graph.gif", frames, duration=0.3)
+
 
 import math
 import matplotlib.pyplot as plt
