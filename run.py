@@ -52,12 +52,14 @@ class DynamicCRF:
             "head_on", "crossing", "overtaking",
             "A_stand_on_B", "A_give_way_B",
             "B_stand_on_A", "B_give_way_A",
-            "approaching", "near", "fixed", "none"
+            "approaching", "passing", "near", "none"
         ]
         self.near_dist = 30.0
         self.vhf_parser = VHFIntentParser()
         self.prev_edge_beliefs = {}
         self.temporal_weight = 2.0
+        self.intent_memory = {}  # sender_id -> strength
+        self.intent_decay = 0.9
 
     # ---------- utils ----------
     def _wrap(self, a):
@@ -103,49 +105,90 @@ class DynamicCRF:
         closing = -(dx * rvx + dy * rvy) / d
         return d, bearing, closing
 
+    def apply_relation_validity_mask(self, scores, oi, oj, pCi, pCj):
+        """
+        Soft mask impossible relations based on object types.
+        This does NOT change relation space, only energies.
+        """
+
+        VERY_NEG = -100.0  # soft -∞
+
+        oi_is_ship = pCi.get("ship", 0.0) > 0.6
+        oj_is_ship = pCj.get("ship", 0.0) > 0.6
+
+        oi_is_tss = oi.det_label == "tss_entrance"
+        oj_is_tss = oj.det_label == "tss_entrance"
+
+        # --------------------------------------------------
+        # Ship-only relations
+        # --------------------------------------------------
+        ship_only = [
+            "head_on", "crossing", "overtaking",
+            "A_stand_on_B", "A_give_way_B",
+            "B_stand_on_A", "B_give_way_A",
+        ]
+
+        if not (oi_is_ship and oj_is_ship):
+            for r in ship_only:
+                scores[r] += VERY_NEG
+
+        # --------------------------------------------------
+        # Approaching: only ship → TSS
+        # --------------------------------------------------
+        if not (oi_is_ship and oj_is_tss):
+            scores["approaching"] += VERY_NEG
+
+        if not (oi_is_ship and oj_is_tss):
+            scores["passing"] += VERY_NEG
+
+        return scores
+
     # ---------- edge unary ----------
-    def edge_unary(self, oi, oj, pCi, goal_intent):
+    def edge_unary(self, oi, oj, pCi, pCj, goal_intent):
         d, bearing, closing = self.rel(oi, oj)
         scores = {r: -4.0 for r in self.relations}
         scores["none"] = -1.5
 
-        # -----------------------------------------
-        # 기존 geometry-based relation evidence
-        # -----------------------------------------
+        oi_is_ship = pCi.get("ship", 0.0) > 0.6
+        oj_is_ship = pCj.get("ship", 0.0) > 0.6
+        oj_is_tss = (oj.det_label == "tss_entrance")
+
+        # near는 타입 무관하게 써도 됨
         if d < self.near_dist:
             scores["near"] += 2.0
-        if abs(bearing) < math.radians(15) and closing > 0:
-            scores["head_on"] += 3.0
-        if abs(abs(bearing) - math.pi / 2) < math.radians(30) and closing > 0:
-            scores["crossing"] += 3.0
 
-        # ============================================================
-        # ✅ OR 조건 approaching: geometry OR VHF (soft, balanced)
-        # ============================================================
-        if pCi.get("ship", 0) > 0.6 and oj.det_label == "tss_entrance":
-            # 1) Geometry evidence for "approaching" (soft continuous)
-            # - closing > 0 (approaching speed)
-            # - distance small-ish
-            geom_app = 0.0
+        # ✅ ship–ship일 때만 head_on / crossing
+        if oi_is_ship and oj_is_ship:
+            if abs(bearing) < math.radians(15) and closing > 0:
+                scores["head_on"] += 3.0
+            if abs(abs(bearing) - math.pi / 2) < math.radians(30) and closing > 0:
+                scores["crossing"] += 3.0
 
-            # closing term: normalize (튜닝 가능)
-            if closing > 0:
-                geom_app += min(closing / 3.0, 1.0)  # 0~1
+        # ✅ ship → tss일 때만 approaching/passing
+        if oi_is_ship and oj_is_tss:
+            geom_strength = max(0.0, 1.0 - d / 120.0)
+            speed_strength = min(abs(closing) / 3.0, 1.0)
+            vhf_strength = self.intent_memory.get(oi.obj_id, 0.0)
 
-            # distance term: 가까울수록 1에 가까움 (튜닝 가능)
-            geom_app += max(0.0, 1.0 - d / 120.0)  # 0~1
+            w_geom = 2.0
+            w_vhf = 0.1
 
-            # 2) VHF evidence (already 0~1)
-            vhf_app = float(goal_intent)  # 0 or 1 in your parser
+            eps = 0.3
+            if closing > eps:
+                scores["approaching"] += (
+                        w_geom * (geom_strength + speed_strength)
+                        + w_vhf * vhf_strength * (geom_strength + speed_strength)
+                )
+            else:
+                # closing <= eps : 유지 or 멀어짐 → passing
+                scores["passing"] += (
+                        w_geom * (geom_strength + speed_strength)
+                )
 
-            # 3) OR 방식 합성: 둘 중 하나만 커도 올라감, 둘 다면 더 올라감
-            w_geom = 2.0  # geometry weight (튜닝)
-            w_vhf = 2.0  # vhf weight (튜닝)
+            scores["none"] -= 0.5 * (geom_strength + speed_strength + vhf_strength)
 
-            scores["approaching"] += w_geom * geom_app + w_vhf * vhf_app
-
-            # none도 조금 눌러주되, 과하게 누르지 않음 (100% 방지)
-            scores["none"] -= 0.5 * (geom_app + vhf_app)
+        # 마스크는 “안전벨트”로만 남기고, 핵심은 위에서 게이팅하는 것
+        scores = self.apply_relation_validity_mask(scores, oi, oj, pCi, pCj)
 
         return scores
 
@@ -161,8 +204,13 @@ class DynamicCRF:
     def apply_node_edge_coupling(self, node_beliefs, edge_beliefs):
         for (i, j), pR in edge_beliefs.items():
             if pR.get("approaching", 0.0) > 0.5:
-                node_beliefs[i]["ship"] += 1.5
-                node_beliefs[j]["ship"] += 0.5
+                # i는 ship 쪽으로 강화
+                node_beliefs[i]["ship"] += 2.0
+
+                # j는 tss / fixed 쪽으로 강화
+                if "tss_entrance" in node_beliefs[j]:
+                    node_beliefs[j]["tss_entrance"] += 2.0
+                    node_beliefs[j]["ship"] -= 2.0  # ❗ ship 억제 (중요)
 
             ship_rel_strength = (
                     pR.get("crossing", 0.0)
@@ -196,9 +244,9 @@ class DynamicCRF:
         scores["overtaking"] -= w_medium * max(0.0, scores["approaching"])
         scores["approaching"] -= w_medium * max(0.0, scores["overtaking"])
 
-        # fixed ↔ crossing
-        scores["crossing"] -= w_medium * max(0.0, scores["fixed"])
-        scores["fixed"] -= w_medium * max(0.0, scores["crossing"])
+        # scores["approaching"] -= w_strong * max(0.0, scores["passing"])
+        # scores["passing"] -= w_strong * max(0.0, scores["approaching"])
+
 
         return scores
 
@@ -222,7 +270,13 @@ class DynamicCRF:
             for msg in vhf_messages:
                 gi = self.vhf_parser.parse_goal_intent(msg.text)
                 if gi > 0:
-                    goal_intent[msg.sender_id] = gi
+                    self.intent_memory[msg.sender_id] = 1.0
+
+        # decay
+        for k in list(self.intent_memory.keys()):
+            self.intent_memory[k] *= self.intent_decay
+            if self.intent_memory[k] < 0.05:
+                del self.intent_memory[k]
 
         # --------------------------------------------------
         # 3. Mean-field iteration
@@ -239,6 +293,7 @@ class DynamicCRF:
                     scores = self.edge_unary(
                         oi, oj,
                         node_beliefs[oi.obj_id],
+                        node_beliefs[oj.obj_id],
                         gi
                     )
 
