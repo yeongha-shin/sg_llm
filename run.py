@@ -166,6 +166,9 @@ class DynamicCRF:
 
         # ✅ ship → tss일 때만 approaching/passing
         if oi_is_ship and oj_is_tss:
+            scores["approaching"] = -2.0  # instead of -4
+            scores["passing"] = -2.0
+
             geom_strength = max(0.0, 1.0 - d / 120.0)
             speed_strength = min(abs(closing) / 3.0, 1.0)
             vhf_strength = self.intent_memory.get(oi.obj_id, 0.0)
@@ -173,7 +176,7 @@ class DynamicCRF:
             w_geom = 2.0
             w_vhf = 0.1
 
-            eps = 0.3
+            eps = 0.1
             if closing > eps:
                 scores["approaching"] += (
                         w_geom * (geom_strength + speed_strength)
