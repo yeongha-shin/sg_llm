@@ -258,39 +258,45 @@ class DynamicCRF:
             self,
             obs: List[ObjObs],
             vhf_messages: Optional[List[VHFMessage]] = None,
-            mf_iters: int = 3,  # ⭐ mean-field iteration 횟수
+            mf_iters: int = 3,
     ):
         # --------------------------------------------------
-        # 1. Node unary initialization
+        # 1) Node unary initialization
         # --------------------------------------------------
         node_beliefs = {o.obj_id: self.node_belief(o) for o in obs}
 
         # --------------------------------------------------
-        # 2. Parse VHF intent
+        # 2) Parse VHF intent (1-shot + memory)
         # --------------------------------------------------
-        goal_intent = {}
+        goal_intent: Dict[int, float] = {}
         if vhf_messages:
             for msg in vhf_messages:
-                gi = self.vhf_parser.parse_goal_intent(msg.text)
-                if gi > 0:
-                    self.intent_memory[msg.sender_id] = 1.0
+                gi = float(self.vhf_parser.parse_goal_intent(msg.text))
+                if gi > 0.0:
+                    goal_intent[msg.sender_id] = max(
+                        goal_intent.get(msg.sender_id, 0.0), gi
+                    )
+                    self.intent_memory[msg.sender_id] = max(
+                        self.intent_memory.get(msg.sender_id, 0.0), gi
+                    )
 
-        # decay
+        # decay intent memory
         for k in list(self.intent_memory.keys()):
             self.intent_memory[k] *= self.intent_decay
             if self.intent_memory[k] < 0.05:
                 del self.intent_memory[k]
 
         # --------------------------------------------------
-        # 3. Mean-field iteration
+        # 3) Mean-field iteration
         # --------------------------------------------------
         for _ in range(mf_iters):
             edge_beliefs = {}
 
-            # ---------- edge update ----------
+            # ---------- (A) edge update ----------
             for i in range(len(obs)):
                 for j in range(i + 1, len(obs)):
                     oi, oj = obs[i], obs[j]
+
                     gi = goal_intent.get(oi.obj_id, 0.0)
 
                     scores = self.edge_unary(
@@ -300,40 +306,69 @@ class DynamicCRF:
                         gi
                     )
 
-                    key = (oi.obj_id, oj.obj_id)
+                    # ship–ship VHF bias (logit space)
+                    a, b = oi.obj_id, oj.obj_id
+                    if (
+                            node_beliefs[a].get("ship", 0.0) > 0.6
+                            and node_beliefs[b].get("ship", 0.0) > 0.6
+                    ):
+                        if gi > 0.8:
+                            scores["A_stand_on_B"] += 8.0
+                            scores["B_give_way_A"] += 8.0
+                            scores["crossing"] -= 6.0
+                            scores["head_on"] -= 6.0
+                            scores["overtaking"] -= 6.0
+                            scores["none"] -= 1.0
+
+                    key = (a, b)
                     scores = self.apply_temporal_potential(key, scores)
                     scores = self.apply_relation_mutex(scores)
 
                     edge_beliefs[key] = self._softmax(scores)
 
-            # ---------- ship–ship bias (기존 로직 유지) ----------
-            for (a, b), pR in edge_beliefs.items():
-                if (
-                        node_beliefs[a].get("ship", 0) > 0.6
-                        and node_beliefs[b].get("ship", 0) > 0.6
-                ):
-                    gi = goal_intent.get(a, 0.0)
-                    if gi > 0.8:
-                        p = dict(pR)
+            # ==================================================
+            # (B) 🔗 relation–relation coupling
+            # A → TSS approaching  ⇒  others give-way to A
+            # ==================================================
+            for (i, j), pR in list(edge_beliefs.items()):
+                oi = next(o for o in obs if o.obj_id == i)
+                oj = next(o for o in obs if o.obj_id == j)
 
-                        # a가 VHF로 협조 요청 → a는 stand-on, b는 give-way
-                        p["A_stand_on_B"] += 4.0
-                        p["B_give_way_A"] += 4.0
+                # i = ship, j = TSS
+                if oi.det_label == "ship" and oj.det_label == "tss_entrance":
+                    p_app = pR.get("approaching", 0.0)
 
-                        # conflicting relations suppress
-                        p["crossing"] *= 0.05
-                        p["head_on"] *= 0.05
-                        p["none"] *= 0.05
+                    if p_app > 0.3:
+                        for ok in obs:
+                            if ok.obj_id == i:
+                                continue
+                            if ok.det_label != "ship":
+                                continue
 
-                        edge_beliefs[(a, b)] = self._softmax(p)
+                            key2 = tuple(sorted((ok.obj_id, i)))
+                            if key2 not in edge_beliefs:
+                                continue
 
-            # ---------- node update ----------
+                            p2 = dict(edge_beliefs[key2])
+
+                            # approaching strength → give-way strength
+                            p2["B_give_way_A"] += 3.0 * p_app
+                            p2["A_stand_on_B"] += 2.0 * p_app
+
+                            # suppress conflicting relations
+                            p2["crossing"] -= 2.0 * p_app
+                            p2["head_on"] -= 2.0 * p_app
+                            p2["overtaking"] -= 2.0 * p_app
+
+                            edge_beliefs[key2] = self._softmax(p2)
+
+            # ---------- (C) node update ----------
             node_beliefs = self.apply_node_edge_coupling(
                 node_beliefs, edge_beliefs
             )
 
         # --------------------------------------------------
-        # 4. Store temporal memory & return
+        # 4) Store temporal memory & return
         # --------------------------------------------------
         self.prev_edge_beliefs = edge_beliefs
         return node_beliefs, edge_beliefs
