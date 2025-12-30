@@ -50,7 +50,8 @@ class DynamicCRF:
     def __init__(self):
         self.relations = [
             "head_on", "crossing", "overtaking",
-            "stand_on", "yielding",
+            "A_stand_on_B", "A_give_way_B",
+            "B_stand_on_A", "B_give_way_A",
             "approaching", "near", "fixed", "none"
         ]
         self.near_dist = 30.0
@@ -108,6 +109,9 @@ class DynamicCRF:
         scores = {r: -4.0 for r in self.relations}
         scores["none"] = -1.5
 
+        # -----------------------------------------
+        # 기존 geometry-based relation evidence
+        # -----------------------------------------
         if d < self.near_dist:
             scores["near"] += 2.0
         if abs(bearing) < math.radians(15) and closing > 0:
@@ -115,12 +119,33 @@ class DynamicCRF:
         if abs(abs(bearing) - math.pi / 2) < math.radians(30) and closing > 0:
             scores["crossing"] += 3.0
 
-        # HARD TSS + VHF PRIOR
+        # ============================================================
+        # ✅ OR 조건 approaching: geometry OR VHF (soft, balanced)
+        # ============================================================
         if pCi.get("ship", 0) > 0.6 and oj.det_label == "tss_entrance":
-            scores["approaching"] += 4.0
-            if goal_intent > 0.8:
-                scores["approaching"] += 10.0
-                scores["none"] -= 8.0
+            # 1) Geometry evidence for "approaching" (soft continuous)
+            # - closing > 0 (approaching speed)
+            # - distance small-ish
+            geom_app = 0.0
+
+            # closing term: normalize (튜닝 가능)
+            if closing > 0:
+                geom_app += min(closing / 3.0, 1.0)  # 0~1
+
+            # distance term: 가까울수록 1에 가까움 (튜닝 가능)
+            geom_app += max(0.0, 1.0 - d / 120.0)  # 0~1
+
+            # 2) VHF evidence (already 0~1)
+            vhf_app = float(goal_intent)  # 0 or 1 in your parser
+
+            # 3) OR 방식 합성: 둘 중 하나만 커도 올라감, 둘 다면 더 올라감
+            w_geom = 2.0  # geometry weight (튜닝)
+            w_vhf = 2.0  # vhf weight (튜닝)
+
+            scores["approaching"] += w_geom * geom_app + w_vhf * vhf_app
+
+            # none도 조금 눌러주되, 과하게 누르지 않음 (100% 방지)
+            scores["none"] -= 0.5 * (geom_app + vhf_app)
 
         return scores
 
@@ -134,30 +159,25 @@ class DynamicCRF:
         return scores
 
     def apply_node_edge_coupling(self, node_beliefs, edge_beliefs):
-        """
-        One-step mean-field style node update from edge beliefs
-        """
         for (i, j), pR in edge_beliefs.items():
-            # --- approaching implies ship ---
             if pR.get("approaching", 0.0) > 0.5:
                 node_beliefs[i]["ship"] += 1.5
-                node_beliefs[j]["ship"] += 0.5  # weaker for target
+                node_beliefs[j]["ship"] += 0.5
 
-            # --- ship-ship relations ---
             ship_rel_strength = (
                     pR.get("crossing", 0.0)
                     + pR.get("head_on", 0.0)
-                    + pR.get("stand_on", 0.0)
-                    + pR.get("yielding", 0.0)
+                    + pR.get("A_stand_on_B", 0.0)
+                    + pR.get("A_give_way_B", 0.0)
+                    + pR.get("B_stand_on_A", 0.0)
+                    + pR.get("B_give_way_A", 0.0)
             )
             if ship_rel_strength > 0.6:
                 node_beliefs[i]["ship"] += 1.0
                 node_beliefs[j]["ship"] += 1.0
 
-        # re-normalize node beliefs
         for i in node_beliefs:
             node_beliefs[i] = self._softmax(node_beliefs[i])
-
         return node_beliefs
 
     def apply_relation_mutex(self, scores):
@@ -237,10 +257,16 @@ class DynamicCRF:
                     gi = goal_intent.get(a, 0.0)
                     if gi > 0.8:
                         p = dict(pR)
-                        p["stand_on"] += 4.0
-                        p["yielding"] += 3.0
+
+                        # a가 VHF로 협조 요청 → a는 stand-on, b는 give-way
+                        p["A_stand_on_B"] += 4.0
+                        p["B_give_way_A"] += 4.0
+
+                        # conflicting relations suppress
                         p["crossing"] *= 0.05
+                        p["head_on"] *= 0.05
                         p["none"] *= 0.05
+
                         edge_beliefs[(a, b)] = self._softmax(p)
 
             # ---------- node update ----------
@@ -273,8 +299,10 @@ class SceneGraphVisualizer:
 
         edge_colors = {
             "approaching": "green",
-            "stand_on": "red",
-            "yielding": "blue",
+            "A_stand_on_B": "red",
+            "A_give_way_B": "blue",
+            "B_stand_on_A": "red",
+            "B_give_way_A": "blue",
             "crossing": "orange",
             "head_on": "purple",
             "near": "gray",
