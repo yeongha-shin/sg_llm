@@ -149,65 +149,87 @@ class DynamicCRF:
         return scores
 
     # ---------- edge unary ----------
-    def edge_unary(self, oi, oj, pCi, pCj, goal_intent):
+    def edge_unary_energy(self, oi, oj, pCi, pCj):
+        """
+        Unary energy for relation R_ij.
+        Lower energy = more plausible relation.
+        """
         d, bearing, closing = self.rel(oi, oj)
-        scores = {r: -4.0 for r in self.relations}
-        scores["none"] = -1.5
+
+        E = {r: 0.0 for r in self.relations}
 
         oi_is_ship = pCi.get("ship", 0.0) > 0.6
         oj_is_ship = pCj.get("ship", 0.0) > 0.6
         oj_is_tss = (oj.det_label == "tss_entrance")
 
-        # near는 타입 무관하게 써도 됨
+        # ----------------------------
+        # proximity
+        # ----------------------------
         if d < self.near_dist:
-            scores["near"] += 2.0
+            E["near"] -= 1.0
 
-        # ✅ ship–ship일 때만 head_on / crossing
+        # ----------------------------
+        # ship–ship geometry
+        # ----------------------------
         if oi_is_ship and oj_is_ship:
             if abs(bearing) < math.radians(15) and closing > 0:
-                scores["head_on"] += 3.0
+                E["head_on"] -= 2.0
             if abs(abs(bearing) - math.pi / 2) < math.radians(30) and closing > 0:
-                scores["crossing"] += 3.0
+                E["crossing"] -= 2.0
+        else:
+            # ship-only relations invalid
+            for r in [
+                "head_on", "crossing", "overtaking",
+                "A_stand_on_B", "A_give_way_B",
+                "B_stand_on_A", "B_give_way_A"
+            ]:
+                E[r] += 5.0
 
-        # ✅ ship → tss일 때만 approaching/passing
+        # ----------------------------
+        # ship → TSS
+        # ----------------------------
         if oi_is_ship and oj_is_tss:
-            scores["approaching"] = -2.0  # instead of -4
-            scores["passing"] = -2.0
-
-            geom_strength = max(0.0, 1.0 - d / 120.0)
-            speed_strength = min(abs(closing) / 3.0, 1.0)
-            vhf_strength = self.intent_memory.get(oi.obj_id, 0.0)
-
-            w_geom = 2.0
-            w_vhf = 0.1
-
-            eps = 0.1
-            if closing > eps:
-                scores["approaching"] += (
-                        w_geom * (geom_strength + speed_strength)
-                        + w_vhf * vhf_strength * (geom_strength + speed_strength)
-                )
+            if closing > 0:
+                E["approaching"] -= 2.0
             else:
-                # closing <= eps : 유지 or 멀어짐 → passing
-                scores["passing"] += (
-                        w_geom * (geom_strength + speed_strength)
-                )
+                E["passing"] -= 1.0
+        else:
+            E["approaching"] += 5.0
+            E["passing"] += 5.0
 
-            scores["none"] -= 0.5 * (geom_strength + speed_strength + vhf_strength)
+        return E
 
-        # 마스크는 “안전벨트”로만 남기고, 핵심은 위에서 게이팅하는 것
-        scores = self.apply_relation_validity_mask(scores, oi, oj, pCi, pCj)
-
-        return scores
-
-    def apply_temporal_potential(self, key, scores):
+    def temporal_energy(self, key, E):
+        """
+        Temporal consistency potential.
+        Penalize relation changes across frames.
+        """
         if key not in self.prev_edge_beliefs:
-            return scores
+            return E
 
-        prev = self.prev_edge_beliefs[key]
-        for r in scores:
-            scores[r] += self.temporal_weight * prev.get(r, 0.0)
-        return scores
+        prev_r = max(
+            self.prev_edge_beliefs[key],
+            key=self.prev_edge_beliefs[key].get
+        )
+
+        for r in E:
+            if r == prev_r:
+                E[r] -= self.temporal_weight
+            else:
+                E[r] += self.temporal_weight
+
+        return E
+
+    def contextual_energy(self, Rij, Rik):
+        """
+        Higher-order contextual potential between relations.
+        """
+        if Rik == "approaching":
+            if Rij in ["crossing", "head_on"]:
+                return +2.0  # conflict
+            if Rij in ["A_stand_on_B", "B_give_way_A"]:
+                return -2.0  # consistent
+        return 0.0
 
     def apply_node_edge_coupling(self, node_beliefs, edge_beliefs):
         for (i, j), pR in edge_beliefs.items():
@@ -284,16 +306,12 @@ class DynamicCRF:
         node_beliefs = {o.obj_id: self.node_belief(o) for o in obs}
 
         # --------------------------------------------------
-        # 2) Parse VHF intent (1-shot + memory)
+        # 2) Parse VHF intent (memory update only)
         # --------------------------------------------------
-        goal_intent: Dict[int, float] = {}
         if vhf_messages:
             for msg in vhf_messages:
                 gi = float(self.vhf_parser.parse_goal_intent(msg.text))
                 if gi > 0.0:
-                    goal_intent[msg.sender_id] = max(
-                        goal_intent.get(msg.sender_id, 0.0), gi
-                    )
                     self.intent_memory[msg.sender_id] = max(
                         self.intent_memory.get(msg.sender_id, 0.0), gi
                     )
@@ -310,42 +328,31 @@ class DynamicCRF:
         for _ in range(mf_iters):
             edge_beliefs = {}
 
-            # ---------- (A) edge update ----------
+            # ==============================
+            # (A) Edge update (ENERGY)
+            # ==============================
             for i in range(len(obs)):
                 for j in range(i + 1, len(obs)):
                     oi, oj = obs[i], obs[j]
+                    a, b = oi.obj_id, oj.obj_id
 
-                    gi = goal_intent.get(oi.obj_id, 0.0)
-
-                    scores = self.edge_unary(
+                    # ---- unary energy ----
+                    E = self.edge_unary_energy(
                         oi, oj,
-                        node_beliefs[oi.obj_id],
-                        node_beliefs[oj.obj_id],
-                        gi
+                        node_beliefs[a],
+                        node_beliefs[b]
                     )
 
-                    # ship–ship VHF bias (logit space)
-                    a, b = oi.obj_id, oj.obj_id
-                    if (
-                            node_beliefs[a].get("ship", 0.0) > 0.6
-                            and node_beliefs[b].get("ship", 0.0) > 0.6
-                    ):
-                        if gi > 0.8:
-                            scores["A_stand_on_B"] += 8.0
-                            scores["B_give_way_A"] += 8.0
-                            scores["crossing"] -= 6.0
-                            scores["head_on"] -= 6.0
-                            scores["overtaking"] -= 6.0
-                            scores["none"] -= 1.0
+                    # ---- temporal energy ----
+                    E = self.temporal_energy((a, b), E)
 
-                    key = (a, b)
-                    scores = self.apply_temporal_potential(key, scores)
-                    scores = self.apply_relation_mutex(scores)
-
-                    edge_beliefs[key] = self._softmax(scores)
+                    # ---- energy → probability ----
+                    edge_beliefs[(a, b)] = self._softmax(
+                        {r: -E[r] for r in E}
+                    )
 
             # ==================================================
-            # (B) 🔗 relation–relation coupling
+            # (B) Higher-order contextual coupling (ENERGY STYLE)
             # A → TSS approaching  ⇒  others give-way to A
             # ==================================================
             for (i, j), pR in list(edge_beliefs.items()):
@@ -358,16 +365,33 @@ class DynamicCRF:
 
                     if p_app > 0.3:
                         for ok in obs:
-                            if ok.obj_id == i:
-                                continue
-                            if ok.det_label != "ship":
+                            if ok.obj_id == i or ok.det_label != "ship":
                                 continue
 
                             k_id = ok.obj_id
+                            key2 = tuple(sorted((k_id, i)))
+                            if key2 not in edge_beliefs:
+                                continue
 
-                            # ----------------------------------
-                            # ✅ (1) coop 업데이트 (행동 기반)
-                            # ----------------------------------
+                            # --- rebuild energy from belief ---
+                            E2 = {
+                                r: -math.log(edge_beliefs[key2].get(r, 1e-12))
+                                for r in self.relations
+                            }
+
+                            # contextual energy
+                            for r in E2:
+                                E2[r] += self.contextual_energy(
+                                    Rij=r,
+                                    Rik="approaching"
+                                )
+
+                            # update belief
+                            edge_beliefs[key2] = self._softmax(
+                                {r: -E2[r] for r in E2}
+                            )
+
+                            # optional: update cooperation belief
                             if delta_heading is not None:
                                 dh = delta_heading.get(k_id, 0.0)
                                 self.update_coop_from_action(
@@ -376,26 +400,9 @@ class DynamicCRF:
                                     p_app=p_app
                                 )
 
-                            # ----------------------------------
-                            # (2) coop 반영하여 relation 보정
-                            # ----------------------------------
-                            key2 = tuple(sorted((k_id, i)))
-                            if key2 not in edge_beliefs:
-                                continue
-
-                            p2 = dict(edge_beliefs[key2])
-                            p_coop = self.coop.get(k_id, 0.5)
-
-                            p2["B_give_way_A"] += 3.0 * p_app * p_coop
-                            p2["A_stand_on_B"] += 3.0 * p_app * p_coop
-
-                            p2["crossing"] -= 2.0 * p_app * p_coop
-                            p2["head_on"] -= 2.0 * p_app
-                            p2["overtaking"] -= 2.0 * p_app
-
-                            edge_beliefs[key2] = self._softmax(p2)
-
-            # ---------- (C) node update ----------
+            # ==============================
+            # (C) Node update
+            # ==============================
             node_beliefs = self.apply_node_edge_coupling(
                 node_beliefs, edge_beliefs
             )
