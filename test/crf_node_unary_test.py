@@ -90,11 +90,24 @@ import math
 
 class CRFSceneGraph:
     def __init__(self):
+        # node unary parameter
+        # --- physical thresholds ---
         self.moving_obj_speed = 1.0
 
+        # --- motion unary parameters ---
+        self.penalty_stopping = 2.0
+        self.scale_static_speed = 0.5
+
+        # --- unary weights ---
+        self.weight_det = 1.0
+        self.weight_motion = 0.5
+
+        # --- numerical stability ---
+        self.detector_eps = 1e-6
 
 
-    def unary_from_detector(self, o: ObjObs, c: str, eps: float = 1e-6) -> float:
+
+    def unary_from_detector(self, o: ObjObs, c: str) -> float:
         """
         Detector confidence 기반 unary energy
         """
@@ -102,29 +115,27 @@ class CRFSceneGraph:
             return 0.0  # detector 없으면 neutral
 
         p = o.det_conf.get(c, 0.0)
-        return -math.log(p + eps)
+        return -math.log(p + self.detector_eps)
 
     def unary_from_motion(self, o: ObjObs, c: str) -> float:
         speed = math.hypot(o.vx, o.vy)
 
         if c == "ship":
-            return 0.0 if speed > self.moving_obj_speed else 2.0
+            return 0.0 if speed > self.moving_obj_speed else self.penalty_stopping
 
         if c in {"buoy", "land", "bridge", "crane"}:
-            return 0.5 * speed
+            return self.scale_static_speed * speed
 
         return 0.0
 
     def node_unary_energy(
             self,
             o: ObjObs,
-            c: str,
-            w_det: float = 1.0,
-            w_motion: float = 0.5
+            c: str
     ) -> float:
         E = 0.0
-        E += w_det * self.unary_from_detector(o, c)
-        E += w_motion * self.unary_from_motion(o, c)
+        E += self.weight_det * self.unary_from_detector(o, c)
+        E += self.weight_motion * self.unary_from_motion(o, c)
         return E
 
     def node_belief(self, o: ObjObs, class_set: List[str]) -> Dict[str, float]:
