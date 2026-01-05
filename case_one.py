@@ -1,3 +1,7 @@
+
+#######################################################################################################################
+#                                                       Utils
+#######################################################################################################################
 from dataclasses import dataclass
 from typing import Optional, Dict, List
 
@@ -78,3 +82,152 @@ def allowed_relations(ci: str, cj: str) -> List[str]:
 
     return ["none"]
 
+
+########################################################################################################################
+#                                                   CRF Model
+########################################################################################################################
+import math
+
+class CRFSceneGraph:
+    def __init__(self):
+        self.moving_obj_speed = 1.0
+
+
+
+    def unary_from_detector(self, o: ObjObs, c: str, eps: float = 1e-6) -> float:
+        """
+        Detector confidence 기반 unary energy
+        """
+        if o.det_conf is None:
+            return 0.0  # detector 없으면 neutral
+
+        p = o.det_conf.get(c, 0.0)
+        return -math.log(p + eps)
+
+    def unary_from_motion(self, o: ObjObs, c: str) -> float:
+        speed = math.hypot(o.vx, o.vy)
+
+        if c == "ship":
+            return 0.0 if speed > self.moving_obj_speed else 2.0
+
+        if c in {"buoy", "land", "bridge", "crane"}:
+            return 0.5 * speed
+
+        return 0.0
+
+    def node_unary_energy(
+            self,
+            o: ObjObs,
+            c: str,
+            w_det: float = 1.0,
+            w_motion: float = 0.5
+    ) -> float:
+        E = 0.0
+        E += w_det * self.unary_from_detector(o, c)
+        E += w_motion * self.unary_from_motion(o, c)
+        return E
+
+    def node_belief(self, o: ObjObs, class_set: List[str]) -> Dict[str, float]:
+        energies = {
+            c: self.node_unary_energy(o, c)
+            for c in class_set
+        }
+        # softmax over -energy
+        mx = min(energies.values())
+        probs = {c: math.exp(-(E - mx)) for c, E in energies.items()}
+        Z = sum(probs.values()) + 1e-12
+        return {c: p / Z for c, p in probs.items()}
+
+
+def main():
+    crf = CRFSceneGraph()
+
+    # -----------------------------
+    # 테스트 객체 정의
+    # -----------------------------
+
+    # 1) 이동 중인 선박 (ship)
+    ship_obs = ObjObs(
+        obj_id=1,
+        t=0,
+        x=0.0,
+        y=0.0,
+        vx=5.0,
+        vy=0.0,
+        heading=0.0,
+        size=10.0,
+        det_conf={
+            "ship": 0.50,
+            "buoy": 0.50,
+            "unknown": 0.10
+        }
+    )
+
+    # 2) 거의 정지한 부표 (buoy)
+    buoy_obs = ObjObs(
+        obj_id=2,
+        t=0,
+        x=20.0,
+        y=5.0,
+        vx=0.05,
+        vy=0.02,
+        heading=0.0,
+        size=2.0,
+        det_conf={
+            "buoy": 0.80,
+            "ship": 0.10,
+            "unknown": 0.10
+        }
+    )
+
+    # 3) detector가 애매한 정적 장애물
+    static_obs = ObjObs(
+        obj_id=3,
+        t=0,
+        x=-10.0,
+        y=15.0,
+        vx=0.0,
+        vy=0.0,
+        heading=0.0,
+        size=30.0,
+        det_conf={
+            "land": 0.40,
+            "bridge": 0.30,
+            "unknown": 0.30
+        }
+    )
+
+    obs_list = [ship_obs, buoy_obs, static_obs]
+
+    # -----------------------------
+    # Node belief 출력
+    # -----------------------------
+    for o in obs_list:
+        print("=" * 80)
+        print(f"Object ID {o.obj_id}")
+        print(f"  position = ({o.x:.1f}, {o.y:.1f})")
+        print(f"  velocity = ({o.vx:.2f}, {o.vy:.2f}) | speed = {math.hypot(o.vx, o.vy):.2f}")
+
+        beliefs = crf.node_belief(o, CLASS_SET)
+
+        # 에너지 값도 같이 출력 (논문 디버깅용)
+        energies = {
+            c: crf.node_unary_energy(o, c)
+            for c in CLASS_SET
+        }
+
+        print("\n  [Unary energies]")
+        for c, E in sorted(energies.items(), key=lambda x: x[1]):
+            print(f"    {c:15s}: {E:.3f}")
+
+        print("\n  [Node belief]")
+        for c, p in sorted(beliefs.items(), key=lambda x: -x[1]):
+            print(f"    {c:15s}: {p:.3f}")
+
+        print(f"  -> MAP class: {max(beliefs, key=beliefs.get)}")
+
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    main()
