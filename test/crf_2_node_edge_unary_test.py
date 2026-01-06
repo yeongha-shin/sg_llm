@@ -250,6 +250,8 @@ class CRFSceneGraph:
     def _to_colreg_state(self, o: ObjObs) -> ShipStateForColreg:
         speed = math.hypot(o.vx, o.vy)
         heading_deg = o.heading  # rad -> deg
+
+        print("speed = ", speed, heading_deg)
         return ShipStateForColreg(x=o.x, y=o.y, speed=speed, heading=heading_deg)
 
     #####################################################################################################################
@@ -335,6 +337,8 @@ class CRFSceneGraph:
 
         role = self.colreg.calc_encounter_role(ego_s, tgt_s)
 
+        print("colreg encounter = ", role)
+
         E = 0.0
         if role == "StarboardCrossing":
             if r == "give_way":
@@ -344,9 +348,9 @@ class CRFSceneGraph:
 
         elif role == "PortCrossing":
             if r == "stand_on":
-                E -= 1.5
+                E -= 2.0
             elif r == "give_way":
-                E += 1.5
+                E += 2.0
 
         elif role == "Headon":
             if r in {"give_way"}:
@@ -396,10 +400,10 @@ class CRFSceneGraph:
                 E += 2.0
 
         elif r == "passing":
-            if closing < 0:
-                E -= 1.5
+            if closing <= 0:
+                E -= 2.0
             else:
-                E += 1.5
+                E += 2.0
 
         return E
 
@@ -589,16 +593,72 @@ class CRFSceneGraph:
 def main():
     crf = CRFSceneGraph()
 
+    # Head on
+
+    # # 예시: ship, buoy, tss
+    # ship_one = ObjObs(
+    #     obj_id=1, t=0, x=0.0, y=0.0, vx=5.0, vy=0.0, heading=90.0, size=10.0,
+    #     det_conf={"ship": 0.7, "buoy": 0.2, "unknown": 0.1}
+    # )
+    #
+    # ship_two = ObjObs(
+    #     obj_id=2, t=0, x=20.0, y=0.0, vx=-5.0, vy=0.0, heading=270.0, size=10.0,
+    #     det_conf={"ship": 0.8, "buoy": 0.1, "unknown": 0.1}
+    # )
+
+    # Crossing
+
     # 예시: ship, buoy, tss
-    ship_one = ObjObs(
-        obj_id=1, t=0, x=0.0, y=0.0, vx=5.0, vy=0.0, heading=90.0, size=10.0,
+    # ship_one = ObjObs(
+    #     obj_id=1, t=0, x=0.0, y=0.0, vx=5.0, vy=0.0, heading=90.0, size=10.0,
+    #     det_conf={"ship": 0.7, "buoy": 0.2, "unknown": 0.1}
+    # )
+    #
+    # ship_two = ObjObs(
+    #     obj_id=2, t=0, x=20.0, y=-20.0, vx=0.0, vy=5.0, heading=0.0, size=10.0,
+    #     det_conf={"ship": 0.8, "buoy": 0.1, "unknown": 0.1}
+    # )
+
+    # # Overtaking
+    #
+    # # # 예시: ship, buoy, tss
+    # ship_one = ObjObs(
+    #     obj_id=1, t=0, x=0.0, y=0.0, vx=0.0, vy=3.0, heading=0.0, size=10.0,
+    #     det_conf={"ship": 0.7, "buoy": 0.2, "unknown": 0.1}
+    # )
+    #
+    # ship_two = ObjObs(
+    #     obj_id=2, t=0, x=0.0, y=-20.0, vx=0.0, vy=5.0, heading=0.0, size=10.0,
+    #     det_conf={"ship": 0.8, "buoy": 0.1, "unknown": 0.1}
+    # )
+
+    # # Ship TSS (Approaching)
+    #
+    # # # 예시: ship, buoy, tss
+    # obs_one = ObjObs(
+    #     obj_id=1, t=0, x=0.0, y=0.0, vx=3.0, vy=3.0, heading=90.0, size=10.0,
+    #     det_conf={"ship": 0.7, "buoy": 0.2, "unknown": 0.1}
+    # )
+    #
+    # obs_two = ObjObs(
+    #     obj_id=2, t=0, x=20.0, y=20.0, vx=0.0, vy=0.0, heading=0.0, size=10.0,
+    #     det_conf={"tss_entrance": 0.9, "unknown": 0.1}
+    # )
+
+    # Ship TSS (Approaching)
+
+    # # 예시: ship, buoy, tss
+    obs_one = ObjObs(
+        obj_id=1, t=0, x=0.0, y=0.0, vx=3.0, vy=-3.0, heading=90.0, size=10.0,
         det_conf={"ship": 0.7, "buoy": 0.2, "unknown": 0.1}
     )
 
-    ship_two = ObjObs(
-        obj_id=2, t=0, x=20.0, y=0.0, vx=-5.0, vy=0.0, heading=270.0, size=10.0,
-        det_conf={"ship": 0.8, "buoy": 0.1, "unknown": 0.1}
+    obs_two = ObjObs(
+        obj_id=2, t=0, x=20.0, y=20.0, vx=0.0, vy=0.0, heading=0.0, size=10.0,
+        det_conf={"tss_entrance": 0.9, "unknown": 0.1}
     )
+
+
 
     # buoy = ObjObs(
     #     obj_id=2, t=0, x=20.0, y=5.0, vx=0.05, vy=0.02, heading=0.0, size=2.0,
@@ -612,7 +672,7 @@ def main():
     #
     # obs = [ship, buoy, tss]
 
-    obs = [ship_one, ship_two]
+    obs = [obs_one, obs_two]
 
     # 1) node beliefs
     node_beliefs = {o.obj_id: crf.node_belief(o, list(CLASS_SET)) for o in obs}
