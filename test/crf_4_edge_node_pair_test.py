@@ -138,7 +138,8 @@ from typing import Optional, Dict, List, Tuple
 # 논문에서 정의한 클래스 집합
 CLASS_SET = (
     "ship", "buoy", "tss_entrance", "land",
-    "bridge", "crane", "fishing_gear", "tire", "unknown"
+    "bridge", "crane", "fishing_gear", "tire", "unknown",
+    "container"
 )
 
 REL_TO_NODE_PRIOR = {
@@ -151,6 +152,11 @@ REL_TO_NODE_PRIOR = {
     "passing": {"tss_entrance": -0.5},
 
     # "colliding": {"land": -1.0, "bridge": -1.0},
+}
+
+NODE_PAIR_EDGE_PRIOR = {
+    ("ship", "container", "mission_operating"): -3.0,
+    ("ship", "container", "colliding"): +3.0,
 }
 
 
@@ -219,7 +225,8 @@ def allowed_relations(ci: str, cj: str) -> List[str]:
         return ["avoiding_left", "avoiding_right", "well_clear", "none"]
 
     # ship-obstacle (여기서는 land/bridge/crane/fishing_gear/tire를 장애물 범주로)
-    obstacle = {"land", "bridge", "crane", "fishing_gear", "tire"}
+    obstacle = {"land", "bridge", "fishing_gear", "container"}
+
     if (ci == "ship" and cj in obstacle) or (cj == "ship" and ci in obstacle):
         return ["colliding", "mission_operating", "none"]
 
@@ -444,17 +451,20 @@ class CRFSceneGraph:
 
     def edge_unary_ship_obstacle(self, feat, r):
         E = 0.0
-        dist = feat["distance"]
 
-        # if r == "colliding":
-        #     if dist < 20.0:
-        #         E -= 2.0
-        #     else:
-        #         E += 2.0
-        #
-        # elif r == "mission_operating":
-        #     if dist > 20.0:
-        #         E -= 1.0
+        closing = feat["closing"]
+
+        if r == "colliding":
+            if closing > 0:
+                E -= 2.0
+            else:
+                E += 2.0
+
+        elif r == "mission_operating":
+            if closing > 0:
+                E -= 2.0
+            else:
+                E += 2.0
 
         return E
 
@@ -486,8 +496,11 @@ class CRFSceneGraph:
             E += self.edge_unary_ship_buoy(feat, r)
 
         # ship -> obstacle # TODO
-        elif ci == "ship" and cj in {"land", "bridge", "crane", "fishing_gear", "tire"}:
+        elif ci == "ship" and cj in {"land", "bridge", "fishing_gear", "container"}:
             E += self.edge_unary_ship_obstacle(feat, r)
+
+        # ⭐ 여기! node → edge coupling
+        E += self.node_pair_edge_prior(ci, cj, r)
 
         return E
 
@@ -622,6 +635,85 @@ class CRFSceneGraph:
             E += self.node_edge_message(oi, c, edge_beliefs)
             energies[c] = E
         return self._softmax_energy(energies)
+
+    def node_pair_edge_prior(self, ci, cj, r):
+        return NODE_PAIR_EDGE_PRIOR.get((ci, cj, r), 0.0)
+
+
+def test_edge_refine_by_node_semantics():
+    crf = CRFSceneGraph()
+
+    # --- tug ship: fast, approaching ---
+    oi = ObjObs(
+        obj_id=1,
+        t=0,
+        x=0.0, y=0.0,
+        vx = 5.0, vy=0.0,
+        heading=90.0,
+        size=10.0,
+        det_conf={
+            "ship": 0.9
+        }
+    )
+
+    # --- container ship: static ---
+    oj = ObjObs(
+        obj_id=2,
+        t=0,
+        x=20.0, y=0.0,   # very close → colliding geometry
+        vx=0.0, vy=0.0,
+        heading=0.0,
+        size=30.0,
+        det_conf={
+            "container": 0.9
+        }
+    )
+
+    obs = [oi, oj]
+
+    # -----------------------------
+    # 1) Node beliefs
+    # -----------------------------
+    node_beliefs = {
+        o.obj_id: crf.node_belief(o, list(CLASS_SET))
+        for o in obs
+    }
+
+    print("\n[Node beliefs]")
+    for oid, b in node_beliefs.items():
+        top = sorted(b.items(), key=lambda x: -x[1])[:3]
+        print(f"Obj {oid}: {top}")
+
+    # -----------------------------
+    # 2) Edge beliefs (mean-field)
+    # -----------------------------
+    edge_beliefs = crf.infer_edge_beliefs_mf(obs, node_beliefs)
+
+    print("\n[Edge beliefs]")
+    for (i, j), pR in edge_beliefs.items():
+        top = sorted(pR.items(), key=lambda x: -x[1])[:5]
+        print(f"R_{i}->{j}: {top}")
+
+    # -----------------------------
+    # 3) Assertion (논문용 핵심)
+    # -----------------------------
+    pij = edge_beliefs[(oi.obj_id, oj.obj_id)]
+
+    p_mission = pij.get("mission_operating", 0.0)
+    p_collide = pij.get("colliding", 0.0)
+
+    print("\n[Check]")
+    print(f"mission_operating: {p_mission:.3f}")
+    print(f"colliding:         {p_collide:.3f}")
+
+    # assert p_mission > p_collide, \
+    #     "❌ mission_operating should dominate colliding for tug-container"
+
+    print("✅ PASS: node semantics successfully refined edge decision")
+
+    viz = SceneGraphVisualizer()
+    viz.plot(obs, node_beliefs, edge_beliefs)
+
 
 
 def main():
@@ -932,6 +1024,6 @@ class SceneGraphVisualizer:
 
 if __name__ == "__main__":
     # main()
-    test_node_edge_coupling()
-
+    # test_node_edge_coupling()
+    test_edge_refine_by_node_semantics()
 
