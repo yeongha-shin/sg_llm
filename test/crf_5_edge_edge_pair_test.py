@@ -1,6 +1,29 @@
 import math
 import numpy as np
 
+def wrap360(deg: float) -> float:
+    return deg % 360.0
+
+def angle_diff_deg(a: float, b: float) -> float:
+    """
+    minimal absolute difference between two bearings (0~360)
+    return in [0, 180]
+    """
+    d = (a - b + 180.0) % 360.0 - 180.0
+    return abs(d)
+
+def bearing_deg(from_x: float, from_y: float, to_x: float, to_y: float) -> float:
+    """
+    Returns nautical-style bearing in degrees:
+    0 = North ( +y ), 90 = East ( +x )
+    """
+    dx = to_x - from_x
+    dy = to_y - from_y
+    # atan2(x, y) gives 0 at North, 90 at East
+    ang = math.degrees(math.atan2(dx, dy))
+    return wrap360(ang)
+
+
 class ColregDecision:
 
     def calc_dcpa_tcpa(self, ego_ship, target_ship):
@@ -271,7 +294,7 @@ class CRFSceneGraph:
         speed = math.hypot(o.vx, o.vy)
         heading_deg = o.heading  # rad -> deg
 
-        print("speed = ", speed, heading_deg)
+        # print("speed = ", speed, heading_deg)
         return ShipStateForColreg(x=o.x, y=o.y, speed=speed, heading=heading_deg)
 
     #####################################################################################################################
@@ -357,7 +380,7 @@ class CRFSceneGraph:
 
         role = self.colreg.calc_encounter_role(ego_s, tgt_s)
 
-        print("colreg encounter = ", role)
+        # print("colreg encounter = ", role)
 
         E = 0.0
         if role == "StarboardCrossing":
@@ -412,9 +435,10 @@ class CRFSceneGraph:
     def edge_unary_ship_goal(self, feat, r):
         E = 0.0
         closing = feat["closing"]
+        dist = feat["distance"]
 
         if r == "approaching":
-            if closing > 0:
+            if closing > 0 and dist < 60:
                 E -= 2.0
             else:
                 E += 2.0
@@ -554,22 +578,20 @@ class CRFSceneGraph:
             class_set: Tuple[str, ...] = CLASS_SET,
             min_pair_prob: float = 1e-4
     ) -> Dict[str, float]:
-        """
-        Mean-field approximation:
-        q_ij(r) ∝ exp( - E_{Ci~q_i, Cj~q_j}[ edge_unary_energy(r|Ci,Cj) ] )
 
-        We approximate expected energy by summing over class pairs.
-        """
         qi = node_beliefs[oi.obj_id]
         qj = node_beliefs[oj.obj_id]
 
-        # expected energy for each relation
+        # -----------------------------
+        # (1) class-marginalized edge unary
+        # -----------------------------
         expE = {r: 0.0 for r in rel_set}
 
         for ci in class_set:
             pi = qi.get(ci, 0.0)
-            if pi <= 0.0:
+            if pi < min_pair_prob:
                 continue
+
             for cj in class_set:
                 pj = qj.get(cj, 0.0)
                 pij = pi * pj
@@ -577,34 +599,21 @@ class CRFSceneGraph:
                     continue
 
                 allowed = set(allowed_relations(ci, cj))
-                for r in rel_set:
-                    if r not in allowed:
-                        continue
-                    # expE[r] += pij * self.edge_unary_energy(oi, oj, ci, cj, r)
+                for r in allowed:
                     E = self.edge_unary_energy(oi, oj, ci, cj, r)
-
-                    E += self.edge_edge_expected_energy(
-                        oi, oj, r,
-                        node_beliefs,
-                        obs
-                    )
-
                     expE[r] += pij * E
 
-                # (선택) forbidden 관계는 확률 0이 되게 하고 싶으면 expE에 따로 반영하지 않음
+        # -----------------------------
+        # (2) edge–edge interaction (한 번만!)
+        # -----------------------------
+        # for r in rel_set:
+        #     expE[r] += self.edge_edge_expected_energy(
+        #         oi, oj, r,
+        #         node_beliefs,
+        #         obs
+        #     )
 
-        # 관계 중에서 "어떤 클래스 조합에서도 허용되지 않은" 관계는 제거
-        energies = {}
-        for r, E in expE.items():
-            # expE가 0.0인 게 실제로 "가능해서 0"인지 "전혀 누적이 안돼서 0"인지 구분이 필요
-            # 안전하게: 최소한 한 번이라도 허용된 관계만 남기자
-            # -> 간단히: allowed_relations가 존재할 때만 남기는 방식으로 재계산
-            energies[r] = E
-
-        # 만약 모든 에너지가 0으로만 남는 특수 케이스(누적이 거의 없을 때) 대비:
-        # 여기서는 softmax가 알아서 균등에 가깝게 됨. 필요하면 "none"에 작은 bias 줄 수 있음.
-
-        return self._softmax_energy(energies)
+        return self._softmax_energy(expE)
 
     # -----------------------------
     # (C) Frame-level edge beliefs for all directed pairs
@@ -680,44 +689,70 @@ class CRFSceneGraph:
         # approaching vs avoiding 방향이 반대면 conflict
         return np.dot(g, avoid_dir) < -0.3
 
+    def angle_between(self, u, v):
+        u = u / (np.linalg.norm(u) + 1e-6)
+        v = v / (np.linalg.norm(v) + 1e-6)
+        cos_theta = np.clip(np.dot(u, v), -1.0, 1.0)
+        return np.arccos(cos_theta)  # [rad]
+
     def edge_edge_expected_energy(
             self,
             oi: ObjObs,
             oj: ObjObs,
             r_oi_oj: str,
-            node_beliefs,
-            obs
+            node_beliefs: Dict[int, Dict[str, float]],
+            obs: List[ObjObs],
+            conflict_angle_deg: float = 45.0,
+            conflict_weight: float = 4.0,
+            debug: bool = True,
     ) -> float:
         """
-        Expected edge–edge interaction energy:
-        penalize conflicting intents (approaching vs give_way)
+        Penalize conflicting intents:
+        - oi -> ok : (goal-directed) approaching
+        - oi -> oj : give_way (requires lateral avoidance, left/right)
+        Conflict if BOTH left and right avoidance headings deviate from goal by >= conflict_angle_deg.
         """
+
+        if r_oi_oj != "give_way":
+            return 0.0
+
+        qi = node_beliefs.get(oi.obj_id, {})
+        if qi.get("ship", 0.0) < 0.5:
+            return 0.0
+
         E = 0.0
 
-        qi = node_beliefs[oi.obj_id]
+        # oi -> oj bearing (obstacle direction)
+        rel_b = bearing_deg(oi.x, oi.y, oj.x, oj.y)
 
-        # oi가 tss_entrance로 향하고 있을 확률
-        for ok_id, qk in node_beliefs.items():
-            if ok_id == oi.obj_id or ok_id == oj.obj_id:
+        for ok in obs:
+            if ok.obj_id in {oi.obj_id, oj.obj_id}:
                 continue
 
-            # ok가 goal일 확률
+            qk = node_beliefs.get(ok.obj_id, {})
             p_goal = qk.get("tss_entrance", 0.0)
-            if p_goal < 0.1:
+            if p_goal < 0.3:
                 continue
 
-            # oi -> ok 가 approaching일 확률 (근사)
-            if r_oi_oj == "give_way":
-                # 방향 충돌 검사
-                ok = next(o for o in obs if o.obj_id == ok_id)
-                goal_dir = np.array([ok.x - oi.x, ok.y - oi.y])
-                avoid_dir = np.array([oj.x - oi.x, oj.y - oi.y])
+            # oi -> ok bearing (goal direction)
+            goal_b = bearing_deg(oi.x, oi.y, ok.x, ok.y)
 
-                if np.dot(goal_dir, avoid_dir) < 0:
-                    E += 2.0 * p_goal
+            diff = angle_diff_deg(goal_b, rel_b)
+
+            # "왼쪽/오른쪽 모두 검사": 둘 다 goal에서 멀면 conflict
+            conflict = (diff >= conflict_angle_deg)
+
+            if debug:
+                print(
+                    f"[edge-edge] oi={oi.obj_id} oj={oj.obj_id} ok={ok.obj_id} | "
+                    f"goal_b={goal_b:6.1f} rel_b={rel_b:6.1f} "
+                    f"conflict={conflict} p_goal={p_goal:.2f}"
+                )
+
+            if conflict:
+                E += conflict_weight * p_goal
 
         return E
-
 
 def test_edge_refine_by_node_semantics():
     crf = CRFSceneGraph()
@@ -1101,8 +1136,77 @@ class SceneGraphVisualizer:
         plt.show()
 
 
+def test_edge_edge_conflict():
+    crf = CRFSceneGraph()
+
+    # -----------------------------
+    # Objects
+    # -----------------------------
+    # ship A (ego)
+    oi = ObjObs(
+        obj_id=1,
+        t=0,
+        x=0.0, y=-40.0,
+        vx=0.0, vy=5.0,     # 위쪽으로 이동
+        heading=0.0,
+        size=10.0,
+        det_conf={"ship": 0.9}
+    )
+
+    # ship B (crossing from left)
+    oj = ObjObs(
+        obj_id=2,
+        t=0,
+        x=-20.0, y=0.0,
+        vx=5.0, vy=5.0,     # 오른쪽 이동
+        heading=90.0,
+        size=10.0,
+        det_conf={"ship": 0.9}
+    )
+
+    # goal (TSS entrance)
+    ok = ObjObs(
+        obj_id=3,
+        t=0,
+        x=0.0, y=20.0,
+        vx=0.0, vy=0.0,
+        heading=0.0,
+        size=5.0,
+        det_conf={"tss_entrance": 0.9}
+    )
+
+    obs = [oi, oj, ok]
+
+    # -----------------------------
+    # Node beliefs
+    # -----------------------------
+    node_beliefs = {
+        o.obj_id: crf.node_belief(o, list(CLASS_SET))
+        for o in obs
+    }
+
+    # -----------------------------
+    # Edge beliefs (WITH edge-edge)
+    # -----------------------------
+    edge_beliefs = crf.infer_edge_beliefs_mf(obs, node_beliefs)
+
+    pij = edge_beliefs[(oi.obj_id, oj.obj_id)]
+
+    print("\n" + "=" * 80)
+    print("[Directed edge beliefs: top-3 relations per edge]")
+    for (i, j), pR in edge_beliefs.items():
+        top = sorted(pR.items(), key=lambda x: -x[1])[:3]
+        print(f"R_{i}->{j}: {top}")
+
+    print("=" * 80)
+
+
+    viz = SceneGraphVisualizer()
+    viz.plot(obs, node_beliefs, edge_beliefs)
+
 if __name__ == "__main__":
     # main()
     # test_node_edge_coupling()
-    test_edge_refine_by_node_semantics()
+    # test_edge_refine_by_node_semantics()
+    test_edge_edge_conflict()
 
