@@ -183,6 +183,19 @@ NODE_PAIR_EDGE_PRIOR = {
 }
 
 
+EDGE_TEMPORAL_COST = {
+    ("give_way", "give_way"): 0.0,
+    ("stand_on", "stand_on"): 0.0,
+    ("overtaking", "overtaking"): 0.0,
+    ("approaching", "approaching"): 0.0,
+
+    ("approaching", "passing"): 0.5,
+    ("passing", "approaching"): 1.0,
+
+    ("give_way", "stand_on"): 3.0,
+    ("stand_on", "give_way"): 3.0,
+}
+
 @dataclass
 class ObjObs:
     obj_id: int
@@ -289,6 +302,7 @@ class CRFSceneGraph:
         self.colreg = ColregDecision()
 
         self.weight_colreg = 1.5
+        self.weight_temporal = 3.0
 
     def _to_colreg_state(self, o: ObjObs) -> ShipStateForColreg:
         speed = math.hypot(o.vx, o.vy)
@@ -574,6 +588,7 @@ class CRFSceneGraph:
             oj: ObjObs,
             node_beliefs: Dict[int, Dict[str, float]],
             obs: List[ObjObs],
+            prev_edge_beliefs: Dict[Tuple[int, int], Dict[str, float]] = None,
             rel_set: Tuple[str, ...] = REL_SET,
             class_set: Tuple[str, ...] = CLASS_SET,
             min_pair_prob: float = 1e-4
@@ -606,12 +621,22 @@ class CRFSceneGraph:
         # -----------------------------
         # (2) edge–edge interaction (한 번만!)
         # -----------------------------
-        # for r in rel_set:
-        #     expE[r] += self.edge_edge_expected_energy(
-        #         oi, oj, r,
-        #         node_beliefs,
-        #         obs
-        #     )
+        for r in rel_set:
+            expE[r] += self.edge_edge_expected_energy(
+                oi, oj, r,
+                node_beliefs,
+                obs
+            )
+
+        # # -------------------------------------------------
+        # # (3) temporal smoothing
+        # # -------------------------------------------------
+        # if prev_edge_beliefs is not None:
+        #     prev = prev_edge_beliefs.get((oi.obj_id, oj.obj_id))
+        #     if prev is not None:
+        #         for r in expE.keys():
+        #             expE[r] += self.weight_temporal * self.edge_temporal_energy(r, prev)
+
 
         return self._softmax_energy(expE)
 
@@ -621,7 +646,8 @@ class CRFSceneGraph:
     def infer_edge_beliefs_mf(
             self,
             obs: List[ObjObs],
-            node_beliefs: Dict[int, Dict[str, float]]
+            node_beliefs: Dict[int, Dict[str, float]],
+            prev_edge_beliefs: Dict[Tuple[int, int], Dict[str, float]] = None
     ) -> Dict[Tuple[int, int], Dict[str, float]]:
         """
         Compute q(R_{i->j}) for all directed pairs i != j.
@@ -631,7 +657,12 @@ class CRFSceneGraph:
             for oj in obs:
                 if oi.obj_id == oj.obj_id:
                     continue
-                edges[(oi.obj_id, oj.obj_id)] = self.edge_belief_mf(oi, oj, node_beliefs, obs)
+                edges[(oi.obj_id, oj.obj_id)] = self.edge_belief_mf(
+                    oi, oj,
+                    node_beliefs,
+                    obs,
+                    prev_edge_beliefs
+                )
         return edges
 
     #####################################################################################################################
@@ -753,6 +784,29 @@ class CRFSceneGraph:
                 E += conflict_weight * p_goal
 
         return E
+
+    #####################################################################################################################
+    #                                               Temporal Energy
+    #####################################################################################################################
+    def edge_temporal_energy(
+            self,
+            r_now: str,
+            prev_edge_belief: Dict[str, float],
+            default_cost: float = 1.5
+    ) -> float:
+        """
+        Expected temporal cost w.r.t previous edge belief
+        """
+        E = 0.0
+        for r_prev, p in prev_edge_belief.items():
+            cost = EDGE_TEMPORAL_COST.get(
+                (r_prev, r_now),
+                default_cost
+            )
+            E += p * cost
+        return E
+
+
 
 def test_edge_refine_by_node_semantics():
     crf = CRFSceneGraph()
@@ -1204,9 +1258,108 @@ def test_edge_edge_conflict():
     viz = SceneGraphVisualizer()
     viz.plot(obs, node_beliefs, edge_beliefs)
 
+def test_temporal_edge_stability():
+    crf = CRFSceneGraph()
+
+    # ======================================================
+    # Frame t = 0
+    # ======================================================
+    oi_t0 = ObjObs(
+        obj_id=1,
+        t=0,
+        x=0.0, y=-30.0,
+        vx=0.0, vy=5.0,          # 북쪽으로 이동
+        heading=0.0,
+        size=10.0,
+        det_conf={"ship": 0.9}
+    )
+
+    oj_t0 = ObjObs(
+        obj_id=2,
+        t=0,
+        x=-20.0, y=20.0,         # 좌측 상단
+        vx=3.5, vy=-4.5,         # 내려오면서 약간 오른쪽
+        heading=140.0,           # crossing 쪽에 가까움
+        size=10.0,
+        det_conf={"ship": 0.9}
+    )
+
+    obs_t0 = [oi_t0, oj_t0]
+
+    node_beliefs_t0 = {
+        o.obj_id: crf.node_belief(o, list(CLASS_SET))
+        for o in obs_t0
+    }
+
+    edge_beliefs_t0 = crf.infer_edge_beliefs_mf(
+        obs_t0,
+        node_beliefs_t0,
+        prev_edge_beliefs=None
+    )
+
+    # ======================================================
+    # Frame t = 1  (slightly different heading → ambiguity)
+    # ======================================================
+    oi_t1 = ObjObs(
+        obj_id=1,
+        t=1,
+        x=0.0, y=-25.0,
+        vx=0.0, vy=5.0,
+        heading=0.0,
+        size=10.0,
+        det_conf={"ship": 0.9}
+    )
+
+    oj_t1 = ObjObs(
+        obj_id=2,
+        t=1,
+        x=-16.5, y=15.5,
+        vx=4.0, vy=-4.0,
+        heading=160.0,           # head-on 쪽으로 살짝 이동
+        size=10.0,
+        det_conf={"ship": 0.9}
+    )
+
+    obs_t1 = [oi_t1, oj_t1]
+
+    node_beliefs_t1 = {
+        o.obj_id: crf.node_belief(o, list(CLASS_SET))
+        for o in obs_t1
+    }
+
+    edge_beliefs_t1 = crf.infer_edge_beliefs_mf(
+        obs_t1,
+        node_beliefs_t1,
+        prev_edge_beliefs=edge_beliefs_t0
+    )
+
+    # ======================================================
+    # Results
+    # ======================================================
+    print("\n" + "=" * 80)
+    print("[Temporal Edge Stability Test]")
+    print("=" * 80)
+
+    def print_edge(title, beliefs):
+        print(f"\n{title}")
+        p = beliefs[(1, 2)]
+        for r, v in sorted(p.items(), key=lambda x: -x[1])[:5]:
+            print(f"{r:15s}: {v:.3f}")
+
+    print_edge("t = 0  (no temporal)", edge_beliefs_t0)
+    print_edge("t = 1  (with temporal)", edge_beliefs_t1)
+
+    # ======================================================
+    # Visualization
+    # ======================================================
+    viz = SceneGraphVisualizer()
+    viz.plot(obs_t0, node_beliefs_t0, edge_beliefs_t0)
+    viz.plot(obs_t1, node_beliefs_t1, edge_beliefs_t1)
+
 if __name__ == "__main__":
     # main()
     # test_node_edge_coupling()
     # test_edge_refine_by_node_semantics()
-    test_edge_edge_conflict()
+    # test_edge_edge_conflict()
+    test_temporal_edge_stability()
 
