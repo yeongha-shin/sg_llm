@@ -634,6 +634,7 @@ class CRFSceneGraph:
         # if prev_edge_beliefs is not None:
         #     prev = prev_edge_beliefs.get((oi.obj_id, oj.obj_id))
         #     if prev is not None:
+
         #         for r in expE.keys():
         #             expE[r] += self.weight_temporal * self.edge_temporal_energy(r, prev)
 
